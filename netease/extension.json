@@ -1,7 +1,7 @@
 {
   "id": "nekotune.netease",
   "name": "网易云音乐 / NetEase Music",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "apiVersion": 2,
   "description": "直接连接网易云音乐，内置 weapi 加密、搜索、歌单、播放、下载及逐字/翻译歌词，无需额外服务。",
   "config": {
