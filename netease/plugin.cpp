@@ -1,4 +1,5 @@
 #include "client.h"
+#include "common/lyrics.h"
 #include <nekotune/sdk/extension_plugin.h>
 #include <QObject>
 #include <memory>
@@ -44,7 +45,7 @@ class Music final : public sdk::IMusicProvider {
             done(result ? Result<sdk::Track>(toTrack(result.value())) : Result<sdk::Track>(result.error()));
         });
     }
-    void resolve(const QString &id, const QString &, std::function<void(Result<sdk::ResolvedAudio>)> done) override {
+    void resolve(const QString &id, sdk::ResolvePurpose, std::function<void(Result<sdk::ResolvedAudio>)> done) override {
         m_client.resolve(id, [done](Result<QVariantMap> result) {
             done(result ? Result<sdk::ResolvedAudio>(toAudio(result.value())) : Result<sdk::ResolvedAudio>(result.error()));
         });
@@ -57,8 +58,8 @@ class Music final : public sdk::IMusicProvider {
 class Lyrics final : public sdk::ILyricsProvider {
   public:
     explicit Lyrics(netease::Client &client) : m_client(client) {}
-    void search(const sdk::Params &query, sdk::Reply done) override {
-        const auto text = (query.value("title").toString() + " " + query.value("artist").toString()).trimmed();
+    void search(const sdk::LyricsQuery &query, std::function<void(Result<QVector<sdk::LyricsCandidate>>)> done) override {
+        const auto text = (query.title + " " + query.artist).trimmed();
         const auto points = text.toUcs4();
         m_client.search(QString::fromUcs4(reinterpret_cast<const char32_t *>(points.constData()), qMin<qsizetype>(points.size(), 64)), {},
                         [done](Result<QVariantMap> result) {
@@ -70,15 +71,18 @@ class Lyrics final : public sdk::ILyricsProvider {
                                 candidate.insert("score", 0);
                                 candidates.append(candidate);
                             }
-                            done(sdk::Params{{"candidates", candidates}});
+                            done(ext::lyricsCandidatesFromList(candidates));
                         });
     }
-    void resolve(const sdk::Params &candidate, sdk::Reply done) override {
-        const auto cover = candidate.value("cover_url").toString();
-        m_client.lyrics(candidate.value("id").toString(), [cover, done](Result<QVariantMap> result) {
-            if (result && !cover.isEmpty())
-                result.value().insert("cover_url", cover);
-            done(result);
+    void resolve(const sdk::LyricsCandidate &candidate, std::function<void(Result<sdk::LyricsResolution>)> done) override {
+        const auto cover = candidate.document.coverUrl;
+        m_client.lyrics(candidate.extra.value("id").toString(), [cover, done](Result<QVariantMap> result) {
+            if (!result)
+                return done(result.error());
+            auto document = result.value();
+            if (!cover.isEmpty())
+                document.insert("cover_url", cover);
+            done(ext::lyricsResolutionFromMap(document));
         });
     }
 
@@ -92,8 +96,8 @@ class NeteasePlugin final : public QObject, public sdk::IExtensionPlugin {
     Q_PLUGIN_METADATA(IID NEKOTUNE_EXTENSION_IID)
     Q_INTERFACES(nekotune::sdk::IExtensionPlugin)
   public:
-    void activate(sdk::IExtensionContext &context, std::function<void(Result<void>)> done) override {
-        const auto config = netease::configuration(context.config());
+    void activate(sdk::ExtensionContext &context, sdk::Done done) override {
+        const auto config = netease::configuration(context.config().get());
         if (!config) {
             done(config.error());
             return;
@@ -101,24 +105,23 @@ class NeteasePlugin final : public QObject, public sdk::IExtensionPlugin {
         m_context = &context;
         m_transport = std::make_unique<ext::NetworkTransport>();
         m_client = std::make_unique<netease::Client>(*m_transport, [this] {
-            const auto current = netease::configuration(m_context->config());
+            const auto current = netease::configuration(m_context->config().get());
             return current ? current.value() : netease::Config{};
         });
         m_music = std::make_unique<Music>(*m_client);
         m_lyrics = std::make_unique<Lyrics>(*m_client);
         // Remove the earlier adapter's unused server settings when upgrading to the direct plugin.
-        if (config.value().toMap() != context.config())
-            context.updateConfig(config.value().toMap(), [](Result<void>) {});
-        add(context.registerMusicProvider("music", m_music.get(),
-                                          {{"name", "网易云 / NetEase"}, {"download", true}, {"page", "music"}}));
-        add(context.registerLyricsProvider("lyrics", m_lyrics.get(), {{"name", "网易云 / NetEase"}}));
+        if (config.value().toMap() != context.config().get())
+            context.config().update(config.value().toMap(), [](Result<void>) {});
+        add(context.music().add("music", m_music.get(), {.name = "网易云 / NetEase", .download = true, .page = "music"}));
+        add(context.lyrics().add("lyrics", m_lyrics.get(), {.name = "网易云 / NetEase"}));
         service("status", [this](const sdk::Params &, sdk::Reply reply) { reply(status()); });
         service("config.set", [this](const sdk::Params &params, sdk::Reply reply) {
             const auto next = netease::configuration(params);
             if (!next)
                 return reply(next.error());
             const auto map = next.value().toMap();
-            m_context->updateConfig(map, [reply, map](Result<void> saved) {
+            m_context->config().update(map, [reply, map](Result<void> saved) {
                 reply(saved ? Result<sdk::Params>(map) : Result<sdk::Params>(saved.error()));
             });
         });
@@ -140,9 +143,9 @@ class NeteasePlugin final : public QObject, public sdk::IExtensionPlugin {
                 return reply(failure("netease_invalid_query"));
             m_client->lyric(params.value("id").toString(), dwrc.toBool(), trlrc.toBool(), reply);
         });
-        add(context.on("extension.config_changed", [this](const sdk::Params &) {
+        add(context.events().on("extension.config_changed", [this](const sdk::Params &) {
             m_client->cancel();
-            m_context->publish("status", status());
+            m_context->events().publish("status", status());
         }));
         done({});
     }
@@ -159,13 +162,13 @@ class NeteasePlugin final : public QObject, public sdk::IExtensionPlugin {
 
   private:
     sdk::Params status() const {
-        const auto current = netease::configuration(m_context->config());
+        const auto current = netease::configuration(m_context->config().get());
         return current ? current.value().toMap() : netease::Config{}.toMap();
     }
     void add(sdk::RegistrationPtr registration) { m_registrations.push_back(std::move(registration)); }
-    void service(const QString &id, sdk::Handler handler) { add(m_context->registerService(id, std::move(handler))); }
+    void service(const QString &id, sdk::Handler handler) { add(m_context->services().add(id, std::move(handler))); }
 
-    sdk::IExtensionContext *m_context = nullptr;
+    sdk::ExtensionContext *m_context = nullptr;
     std::unique_ptr<ext::NetworkTransport> m_transport;
     std::unique_ptr<netease::Client> m_client;
     std::unique_ptr<Music> m_music;
